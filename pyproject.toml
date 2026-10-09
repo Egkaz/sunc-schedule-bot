@@ -1,0 +1,11 @@
+[project]
+name = "sunc-schedule-bot"
+version = "1.0.0"
+description = "Telegram-бот: расписание СУНЦ УрФУ в чате класса"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+addopts = "-q"
