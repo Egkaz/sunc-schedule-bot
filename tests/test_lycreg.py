@@ -10,6 +10,7 @@ import pytest
 from bot.formatter import format_homework
 from bot.lycreg import (
     BASE_URL,
+    HOMEWORK_MAX_AGE_DAYS,
     SUBJ_DEF,
     CaptchaRequired,
     LycregClient,
@@ -19,6 +20,7 @@ from bot.lycreg import (
     journal_date_key,
     key_position,
     pick_homework,
+    pos_date,
 )
 from bot.storage import KEY_LYCREG_TOKEN, Storage
 
@@ -43,6 +45,13 @@ def test_key_position_roundtrip():
         assert key_position(journal_date_key(day)) == date_position(day)
     assert key_position("мусор") is None
     assert key_position("d9xx") is None
+
+
+def test_pos_date_roundtrip_and_guards():
+    for day in (date(2026, 9, 1), date(2026, 10, 10), date(2027, 1, 5), date(2027, 8, 31)):
+        assert pos_date(date_position(day)) == day.replace(year=2000)
+    assert pos_date(1300) is None  # «месяц 13» — мусорная позиция
+    assert pos_date(12) is None
 
 
 JOURNAL = {
@@ -167,6 +176,59 @@ def test_subj_def_covers_core_subjects():
     assert SUBJ_DEF["s610"] == "Физика"
     assert SUBJ_DEF["s210"] == "Английский язык"
     assert SUBJ_DEF["s570"] == "География"
+
+
+def test_pick_homework_skips_when_latest_lesson_has_no_hw():
+    """Свежая запись без ДЗ = «не задано»: старое трёхнедельное не показываем.
+
+    Кейс физики: уроки 12/19/26.09 и 03.10, ДЗ записано только 26.09.
+    """
+    journal = {
+        "10Н_s610_Chern1": {
+            "d026": ["Работа и мощность", "задача 2 (пар11)", "0", ""],
+            "d029": ["Электрический ток", "", "0", ""],
+            "d103": ["Что-то", "", "0", ""],
+        }
+    }
+    hw = pick_homework(
+        journal,
+        "10Н",
+        subject="Физика",
+        teacher="Черемичкина И. С.",
+        target_pos=date_position(date(2026, 10, 10)),
+        teach_by_fio={_norm_fio("Черемичкина И. С."): "Chern1"},
+        subj_names=SUBJ,
+    )
+    assert hw is None  # последний урок (03.10) без ДЗ
+
+
+def test_pick_homework_rejects_stale_hw_from_journal_gap():
+    """Пропуск уроков в журнале: ДЗ старше лимита не показываем."""
+    journal = {"10Н_10H01_Bondar1": {"d026": ["Тема", "ДЗ трёхнедельной давности", "0", ""]}}
+    hw = pick_homework(
+        journal,
+        "10Н",
+        subject="Алгебра",
+        teacher="Бондарь А. А.",
+        target_pos=date_position(date(2026, 10, 10)),  # 14 дней > лимита
+        teach_by_fio=TEACH_BY_FIO,
+        subj_names=SUBJ,
+    )
+    assert hw is None
+
+    fresh_pos = date_position(date(2026, 10, 5))  # 05.10 — в пределах лимита
+    journal_fresh = {"10Н_10H01_Bondar1": {"d026": ["Тема", "ДЗ", "0", ""]}}
+    hw = pick_homework(
+        journal_fresh,
+        "10Н",
+        subject="Алгебра",
+        teacher="Бондарь А. А.",
+        target_pos=fresh_pos,
+        teach_by_fio=TEACH_BY_FIO,
+        subj_names=SUBJ,
+    )
+    assert hw == "ДЗ"  # 9 дней <= 10
+    assert HOMEWORK_MAX_AGE_DAYS == 10
 
 
 def test_format_homework_layout_and_truncation():

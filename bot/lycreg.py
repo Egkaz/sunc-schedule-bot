@@ -28,6 +28,7 @@ HEADERS = {
 }
 SUBJECT_MATCH_THRESHOLD = 0.55
 SUBJECT_CONTAIN_MIN = 4  # мин. длина для совпадения «подстрока в названии»
+HOMEWORK_MAX_AGE_DAYS = 10  # ДЗ старше этого срока не показываем («трёхнедельное»)
 
 # Словарь предметов сайта (subjDef из ini.js); дополняется ответом subjList
 SUBJ_DEF = {
@@ -100,6 +101,21 @@ def key_position(key: str) -> int | None:
     return date_position(date(2000, month, day))
 
 
+def pos_date(pos: int) -> date | None:
+    """Обратное преобразование позиции учебного года → календарная дата."""
+    if pos < 901:
+        return None
+    if pos >= 1400:
+        pos -= 1300
+    month, day = divmod(pos, 100)
+    if not 1 <= month <= 12 or not 1 <= day <= 31:
+        return None
+    try:
+        return date(2000, month, day)
+    except ValueError:
+        return None
+
+
 def _norm_fio(value: str) -> str:
     """ФИО без учёта регистра и пробелов: «И.С.» == «И. С.»."""
     return "".join(value.split()).casefold()
@@ -119,7 +135,10 @@ def pick_homework(
     teach_by_fio: dict[str, str],
     subj_names: dict[str, str],
 ) -> str | None:
-    """Последнее ДЗ по предмету, заданное строго до целевой даты."""
+    """ДЗ урока target: задано на последнем записанном уроке предмета и не старое.
+
+    Пустая свежая запись означает «ДЗ не задано» — трёхнедельную старь не тащим.
+    """
     want_login = teach_by_fio.get(_norm_fio(teacher))
     if want_login is None and "/" in teacher:
         for part in teacher.split("/"):
@@ -168,13 +187,24 @@ def pick_homework(
         ]
 
     best_pos, best_hw = -1, None
+    last_pos = -1
     for dkey, values in journal[candidates[0][0]].items():
         pos = key_position(dkey)
         if pos is None or pos >= target_pos or not values:
             continue
         hw = str(values[1] if len(values) > 1 else "").strip()
+        if pos > last_pos:
+            last_pos = pos
         if hw and pos > best_pos:
             best_pos, best_hw = pos, hw
+    if best_hw is None or best_pos != last_pos:
+        return None  # на последнем уроке ДЗ не задано (или записей вовсе нет)
+    target_date, hw_date = pos_date(target_pos), pos_date(best_pos)
+    if target_date is None or hw_date is None:
+        return None
+    if (target_date - hw_date).days > HOMEWORK_MAX_AGE_DAYS:
+        log.debug("журнал: ДЗ по %s задано %s дн. назад — пропускаю", subject, (target_date - hw_date).days)
+        return None
     return best_hw
 
 
