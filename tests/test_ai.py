@@ -142,6 +142,36 @@ async def test_analyze_no_retry_for_short_banter():
     assert len(calls) == 1, "короткую болтовню не тратим на повтор"
 
 
+async def test_analyze_addressed_forces_reply_with_retry():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content)["messages"][-1]["content"])
+        if len(calls) == 1:
+            return _text_response('{"homework": [], "reply": null}')  # модель промолчала
+        return _text_response('{"homework": [], "reply": "Слушаю! Чем помочь?"}')
+
+    client = _client(handler)
+    analysis = await client.analyze(
+        context="", text="что умеешь?", today=date(2026, 10, 11), addressed=True
+    )
+    assert analysis is not None and analysis.reply == "Слушаю! Чем помочь?"
+    assert len(calls) == 2 and "Тебе обращаются" in calls[1]
+
+
+async def test_analyze_addressed_prompt_demands_reply():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return _text_response('{"homework": [], "reply": "мяу, я на связи"}')
+
+    client = _client(handler)
+    await client.analyze(context="", text="мяу", today=date(2026, 10, 11), addressed=True)
+    system = seen["messages"][0]["content"]
+    assert "ОБЯЗАТЕЛЬНО заполни reply" in system
+
+
 async def test_complete_disables_reasoning():
     seen: dict = {}
 

@@ -8,7 +8,7 @@ BASE = {"BOT_TOKEN": "123456:TESTTOKEN", "CHAT_ID": "-1001234567890", "CLASS": "
 
 
 def _set_env(monkeypatch, **extra: str) -> None:
-    for key in (*BASE, "THREAD_ID", "LYCREG_LOGIN", "LYCREG_PASSWORD", "OPENROUTER_API_KEY"):
+    for key in (*BASE, "THREAD_ID", "LYCREG_LOGIN", "LYCREG_PASSWORD", "OPENROUTER_API_KEY", "AI_TRIGGER"):
         monkeypatch.delenv(key, raising=False)
     for key, value in {**BASE, **extra}.items():
         monkeypatch.setenv(key, value)
@@ -51,3 +51,15 @@ def test_openrouter_key_absent_means_ai_off(monkeypatch):
 def test_openrouter_key_loaded(monkeypatch):
     _set_env(monkeypatch, OPENROUTER_API_KEY="sk-or-v1-test")
     assert load_config().openrouter_key == "sk-or-v1-test"
+
+
+def test_ai_trigger_default_is_miau(monkeypatch):
+    _set_env(monkeypatch)
+    assert load_config().ai_trigger == "мяу"
+
+
+def test_ai_trigger_overridable_and_disableable(monkeypatch):
+    _set_env(monkeypatch, AI_TRIGGER="робот")
+    assert load_config().ai_trigger == "робот"
+    _set_env(monkeypatch, AI_TRIGGER="")
+    assert load_config().ai_trigger == ""

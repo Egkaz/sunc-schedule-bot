@@ -164,7 +164,8 @@ class AIClient:
     ) -> ChatAnalysis | None:
         """Разобрать сообщение чата: ДЗ (с привязкой к дню) и/или ответ на вопрос."""
         address = (
-            "адресовано боту (упомянут бот, это ответ на его сообщение или явный вопрос к нему)"
+            "адресовано боту (упомянут бот, есть слово-триггер, это ответ на его сообщение "
+            "или явный вопрос к нему) — ОБЯЗАТЕЛЬНО заполни reply кратким ответом по существу"
             if addressed
             else "НЕ адресовано боту — reply всегда null"
         )
@@ -190,19 +191,33 @@ class AIClient:
                     continue
                 return None
             analysis = self._parse_analysis(data)
-            # бесплатный роутинг иногда отдаёт пустой результат на первом проходе
-            if attempt == 1 and not analysis.homework and analysis.reply is None and len(text) >= 40:
-                log.info("ИИ: пустой результат на длинном сообщении, повтор")
-                messages = [
-                    *messages,
-                    {"role": "assistant", "content": content[:2000]},
-                    {
-                        "role": "user",
-                        "content": "Проверь ещё раз: в сообщении может быть домашнее задание "
-                        "или вопрос о ДЗ/расписании. Ответь строго JSON.",
-                    },
-                ]
-                continue
+            if attempt == 1:
+                # обращению (триггер/@/ответ) бот обязан ответить — повтор с напоминанием
+                if addressed and analysis.reply is None:
+                    log.info("ИИ: обращение без ответа модели, повтор")
+                    messages = [
+                        *messages,
+                        {"role": "assistant", "content": content[:2000]},
+                        {
+                            "role": "user",
+                            "content": "Тебе обращаются — обязательно ответь кратко по существу "
+                            "(если задали ДЗ — подтверди, что записал). Строго JSON.",
+                        },
+                    ]
+                    continue
+                # бесплатный роутинг иногда отдаёт пустой результат на первом проходе
+                if not analysis.homework and analysis.reply is None and len(text) >= 40:
+                    log.info("ИИ: пустой результат на длинном сообщении, повтор")
+                    messages = [
+                        *messages,
+                        {"role": "assistant", "content": content[:2000]},
+                        {
+                            "role": "user",
+                            "content": "Проверь ещё раз: в сообщении может быть домашнее задание "
+                            "или вопрос о ДЗ/расписании. Ответь строго JSON.",
+                        },
+                    ]
+                    continue
             return analysis
         return None
 

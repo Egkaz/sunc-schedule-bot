@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 
@@ -279,9 +280,15 @@ def create_router(config: Config, service: ScheduleService) -> Router:
             bot_username = me.username
         return bot_username
 
+    trigger = config.ai_trigger.casefold()
+
     @router.message(~F.from_user.is_bot, F.text | F.caption)
     async def ai_chat_message(message: Message) -> None:
-        """Сообщения чата: ИИ собирает ДЗ в БД и отвечает на вопросы (в фоне)."""
+        """Сообщения чата: ИИ собирает ДЗ в БД и отвечает на вопросы (в фоне).
+
+        Бот считает сообщение своим, если в нём есть слово-триггер (AI_TRIGGER,
+        по умолчанию «мяу»), упоминание @бота или ответ на его сообщение.
+        """
         if service.ai is None:
             return
         raw = (message.text or message.caption or "").strip()
@@ -290,14 +297,20 @@ def create_router(config: Config, service: ScheduleService) -> Router:
 
         async def work() -> None:
             try:
+                text = raw
+                addressed = False
+                if trigger and trigger in raw.casefold():
+                    addressed = True
+                    # убираем сам триггер, чтобы модель отвечала по существу
+                    text = re.sub(re.escape(config.ai_trigger), "", raw, flags=re.IGNORECASE).strip(" ,!?.…-–") or raw
                 username = await _resolve_username(message)
-                addressed = bool(username) and f"@{username}".lower() in raw.lower()
+                addressed = addressed or (bool(username) and f"@{username}".lower() in raw.lower())
                 reply_to = message.reply_to_message
                 if reply_to is not None and reply_to.from_user is not None:
                     me = await message.bot.get_me()
                     addressed = addressed or reply_to.from_user.id == me.id
                 reply = await service.handle_chat_message(
-                    text=raw, msg_id=message.message_id, addressed=addressed
+                    text=text, msg_id=message.message_id, addressed=addressed
                 )
                 if reply:
                     await message.answer(reply)
