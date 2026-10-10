@@ -26,7 +26,10 @@ API_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODELS = [
     "nvidia/nemotron-3-ultra-550b-a55b:free",
     "nvidia/nemotron-3.5-lightning:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "inclusionai/ling-3.1-flash",
     "google/gemma-4-31b-it:free",
+    "apodex/apodex-1.1-mini:free",
 ]
 DEFAULT_VISION_MODELS = [
     "dots-studio/dots-3-note-preview:free",  # проверен: точно читает цифры капчи

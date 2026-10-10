@@ -265,6 +265,14 @@ def create_router(config: Config, service: ScheduleService) -> Router:
         await service.set_thread_id(thread)
         await answer(message, f"Принято: посты и уведомления теперь в этой ветке (id {thread}).")
 
+    @router.message(Command("заказать"))
+    async def cmd_order(message: Message, command: CommandObject) -> None:
+        """/заказать пиво — фирменный ответ заведения."""
+        if (command.args or "").strip().casefold() == "пиво":
+            await answer(message, "иди нахуй")
+        else:
+            await answer(message, "Могу заказать только пиво: /заказать пиво")
+
     @router.message(is_admin, CaptchaCodeFilter(service))
     async def captcha_reply(message: Message) -> None:
         """Ответ администратора цифрами — код капчи входа в журнал."""
@@ -316,11 +324,19 @@ def create_router(config: Config, service: ScheduleService) -> Router:
                 if reply_to is not None and reply_to.from_user is not None:
                     me = await message.bot.get_me()
                     addressed = addressed or reply_to.from_user.id == me.id
+                log.info(
+                    "ИИ: сообщение из чата %s (ветка %s, addressed=%s): %r",
+                    message.chat.id,
+                    message.message_thread_id,
+                    addressed,
+                    raw[:80],
+                )
                 reply = await service.handle_chat_message(
                     text=text, msg_id=message.message_id, addressed=addressed
                 )
                 if reply:
                     await message.answer(reply)
+                    log.info("ИИ: ответ отправлен в чат %s: %r", message.chat.id, reply[:80])
             except Exception:  # noqa: BLE001 - фоновая работа ИИ не должна ронять поллинг
                 log.exception("ИИ: сбой обработки сообщения чата")
 
