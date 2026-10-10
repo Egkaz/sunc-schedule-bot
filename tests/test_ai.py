@@ -78,12 +78,13 @@ async def test_analyze_returns_none_on_garbage():
     assert await client.analyze(context="", text="???", today=date(2026, 10, 11), addressed=True) is None
 
 
-async def test_analyze_retries_after_garbage_json():
+async def test_analyze_cascades_past_non_json_model():
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(json.loads(request.content)["messages"][-1]["content"])
-        if len(calls) == 1:
+        model = json.loads(request.content)["model"]
+        calls.append(model)
+        if model == DEFAULT_MODELS[0]:
             return _text_response("модель запуталась и не ответила JSON")
         return _text_response('{"homework": [], "reply": "не нашёл данных"}')
 
@@ -92,8 +93,7 @@ async def test_analyze_retries_after_garbage_json():
         context="", text="какое дз?", today=date(2026, 10, 11), addressed=True
     )
     assert analysis is not None and analysis.reply == "не нашёл данных"
-    assert len(calls) == 2, "после мусорного ответа нужна одна повторная попытка"
-    assert "строго одним JSON" in calls[1]
+    assert calls == DEFAULT_MODELS[:2], "не-JSON ответ должен уводить на следующую модель"
 
 
 def test_extract_json_tolerates_doubled_braces_and_prose():

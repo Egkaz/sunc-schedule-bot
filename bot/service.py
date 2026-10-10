@@ -293,7 +293,7 @@ class ScheduleService:
         if not (AI_MIN_LEN <= len(text) <= AI_MAX_LEN):
             return None
         if self._ai_lock.locked():
-            return None  # при ливне сообщений не копим очередь к бесплатным моделям
+            return "ИИ уже отвечает на другое сообщение, секунду…" if addressed else None
         async with self._ai_lock:
             try:
                 context = await self.ai_context()
@@ -305,8 +305,11 @@ class ScheduleService:
                 )
             except Exception:  # noqa: BLE001 - чат никогда не должен ломать бота
                 log.exception("ИИ: сбой анализа сообщения")
-                return None
+                analysis = None
         if analysis is None:
+            # обращались (триггер/@/реплай) — молчать нельзя, честно скажем о сбое
+            if addressed:
+                return "Сейчас не получилось связаться с ИИ 😔 попробуй ещё раз через минуту."
             return None
         for item in analysis.homework:
             if item.day is None or not item.subject or not item.text:
@@ -319,6 +322,9 @@ class ScheduleService:
                 log.exception("ИИ: не удалось сохранить ДЗ из чата")
         if analysis.reply:
             return analysis.reply[:1000]
+        if addressed:
+            # на обращение молчать нельзя — подскажем, как спросить
+            return "На связи! Спроси про расписание или ДЗ — например: «мяу какое дз завтра?»."
         return None
 
     async def poll(self) -> PollResult:

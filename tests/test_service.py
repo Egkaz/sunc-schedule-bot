@@ -647,6 +647,29 @@ async def test_handle_chat_message_no_reply_returns_none(tmp_path, reference):
         await storage.close()
 
 
+async def test_handle_chat_message_fallback_when_ai_fails(tmp_path, reference):
+    ai = FakeAI(analysis=None)  # все модели вернули мусор / сбой HTTP
+    service, *_ = await _service(tmp_path, reference, {}, ai=ai)
+    reply = await service.handle_chat_message(text="мяу какое дз?", addressed=True)
+    assert reply and "не получилось" in reply, "на обращение бот обязан ответить даже при сбое ИИ"
+
+
+async def test_handle_chat_message_hint_when_addressed_without_content(tmp_path, reference):
+    ai = FakeAI(analysis=ChatAnalysis(homework=[], reply=None))
+    service, *_ = await _service(tmp_path, reference, {}, ai=ai)
+    reply = await service.handle_chat_message(text="мяу", addressed=True)
+    assert reply and "На связи" in reply
+
+
+async def test_handle_chat_message_busy_lock_stays_quiet_for_banter(tmp_path, reference):
+    ai = FakeAI(analysis=ChatAnalysis(reply="ок"))
+    service, *_ = await _service(tmp_path, reference, {}, ai=ai)
+    async with service._ai_lock:
+        assert await service.handle_chat_message(text="просто болтовня какая-то", addressed=False) is None
+        busy = await service.handle_chat_message(text="мяу как дела?", addressed=True)
+        assert busy and "секунду" in busy
+
+
 async def test_ai_context_lists_subjects_and_hw(tmp_path, reference, load_fixture):
     payload = _payload(load_fixture)
     service, storage, *_ = await _service(tmp_path, reference, payload)

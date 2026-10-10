@@ -281,6 +281,13 @@ def create_router(config: Config, service: ScheduleService) -> Router:
         return bot_username
 
     trigger = config.ai_trigger.casefold()
+    _bg_tasks: set[asyncio.Task] = set()
+
+    def _spawn(coro) -> None:
+        """Фоновая задача ИИ: держим ссылку, чтобы GC не убил её на середине."""
+        task = asyncio.create_task(coro)
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
 
     @router.message(~F.from_user.is_bot, F.text | F.caption)
     async def ai_chat_message(message: Message) -> None:
@@ -317,7 +324,7 @@ def create_router(config: Config, service: ScheduleService) -> Router:
             except Exception:  # noqa: BLE001 - фоновая работа ИИ не должна ронять поллинг
                 log.exception("ИИ: сбой обработки сообщения чата")
 
-        asyncio.create_task(work())
+        _spawn(work())
 
     return router
 

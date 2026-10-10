@@ -20,12 +20,12 @@ log = logging.getLogger(__name__)
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Только бесплатные модели; при 429/5xx пробуем следующую.
+# Только бесплатные модели; при 429/5xx/битом ответе пробуем следующую.
 # Важно: «мышление» выключается (reasoning.enabled=false) — иначе reasoning-модели
 # съедают токены и обрезают JSON; openrouter/free для текста ненадёжен (слабый роут).
 DEFAULT_MODELS = [
-    "nvidia/nemotron-3.5-lightning:free",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "nvidia/nemotron-3.5-lightning:free",
     "google/gemma-4-31b-it:free",
 ]
 DEFAULT_VISION_MODELS = [
@@ -104,8 +104,12 @@ class AIClient:
         *,
         vision: bool = False,
         max_tokens: int = 400,
+        expect_json: bool = False,
     ) -> str | None:
-        """Первый успешный ответ среди моделей; сбои и 429/5xx — следующая модель."""
+        """Первый пригодный ответ среди моделей.
+
+        Сбои, 429/5xx, пустой и (при expect_json) не-JSON ответ — следующая модель.
+        """
         models = self._vision_models if vision else self._models
         headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
         for model in models:
@@ -126,7 +130,15 @@ class AIClient:
                 if not text or not str(text).strip():
                     log.info("openrouter: модель %s вернула пустой ответ", model)
                     continue
-                return str(text)
+                text = str(text)
+                if expect_json and self._extract_json(text) is None:
+                    log.info(
+                        "openrouter: модель %s вернула не-JSON (%r…), пробую следующую",
+                        model,
+                        text[:120],
+                    )
+                    continue
+                return text
             except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
                 log.warning("openrouter: сбой модели %s", model, exc_info=True)
         return None
@@ -160,7 +172,7 @@ class AIClient:
         text: str,
         today: date,
         addressed: bool,
-        max_tokens: int = 400,
+        max_tokens: int = 700,
     ) -> ChatAnalysis | None:
         """Разобрать сообщение чата: ДЗ (с привязкой к дню) и/или ответ на вопрос."""
         address = (
@@ -173,8 +185,9 @@ class AIClient:
         user = f"Сегодня: {today:%Y-%m-%d}.\nДанные:\n{context}\n\nСообщение: {text}"
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         for attempt in (1, 2):
-            content = await self._complete(messages, max_tokens=max_tokens)
+            content = await self._complete(messages, max_tokens=max_tokens, expect_json=True)
             if content is None:
+                log.warning("ИИ: ни одна бесплатная модель не дала валидный JSON")
                 return None
             data = self._extract_json(content)
             if data is None:
