@@ -237,3 +237,22 @@ async def test_solve_captcha_rejects_safety_garbage():
     assert client._models  # список моделей не пуст
     long_junk = _client(lambda request: _text_response("это точно не капча а длинная фраза"))
     assert await long_junk.solve_captcha(b"IMG") is None
+
+
+async def test_zov_sends_roleplay_prompt_and_history():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return _text_response("НУ ТИПО БАЗА 🖤")
+
+    client = _client(handler)
+    history = [{"role": "user", "content": "привет"}, {"role": "assistant", "content": "йоу"}]
+    reply = await client.zov(user_text="как дела, Алина?", history=history)
+    assert reply == "НУ ТИПО БАЗА 🖤"
+    messages = seen["messages"]
+    assert "Алины" in messages[0]["content"], "системный промт должен задавать роль"
+    assert "ОГРАНИЧЕНИЯ" in messages[0]["content"]
+    assert messages[1:3] == history
+    assert messages[-1] == {"role": "user", "content": "как дела, Алина?"}
+    assert seen["reasoning"] == {"enabled": False}

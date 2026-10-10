@@ -341,13 +341,20 @@ class FakeLycreg:
 
 
 class FakeAI:
-    """Заглушка AIClient: готовый анализ и/или код капчи."""
+    """Заглушка AIClient: готовый анализ, код капчи и ответ персонажа."""
 
-    def __init__(self, analysis: ChatAnalysis | None = None, captcha_code: str | None = None) -> None:
+    def __init__(
+        self,
+        analysis: ChatAnalysis | None = None,
+        captcha_code: str | None = None,
+        zov_reply: str = "база 🖤 ну типа да",
+    ) -> None:
         self.analysis = analysis
         self.captcha_code = captcha_code
+        self.zov_reply = zov_reply
         self.analyze_calls = 0
         self.captcha_calls = 0
+        self.zov_calls: list[dict] = []
 
     async def analyze(self, **kwargs) -> ChatAnalysis | None:
         self.analyze_calls += 1
@@ -356,6 +363,10 @@ class FakeAI:
     async def solve_captcha(self, image: bytes) -> str | None:
         self.captcha_calls += 1
         return self.captcha_code
+
+    async def zov(self, *, user_text: str, history: list[dict] | None = None, max_tokens: int = 600):
+        self.zov_calls.append({"user_text": user_text, "history": list(history or [])})
+        return self.zov_reply
 
 
 async def test_publish_puts_homework_into_caption(tmp_path, reference, load_fixture):
@@ -668,6 +679,48 @@ async def test_handle_chat_message_busy_lock_stays_quiet_for_banter(tmp_path, re
         assert await service.handle_chat_message(text="просто болтовня какая-то", addressed=False) is None
         busy = await service.handle_chat_message(text="мяу как дела?", addressed=True)
         assert busy and "секунду" in busy
+
+
+async def test_zov_reply_keeps_session_history(tmp_path, reference):
+    ai = FakeAI(zov_reply="своих не бросаем 🔥")
+    service, *_ = await _service(tmp_path, reference, {}, ai=ai)
+    assert not service.zov_active(-1001)
+    reply = await service.zov_reply(chat_id=-1001, text="привет, Алина!")
+    assert reply == "своих не бросаем 🔥"
+    assert service.zov_active(-1001)
+    await service.zov_reply(chat_id=-1001, text="как дела?")
+    # второй запрос увидел историю первого диалога
+    assert len(ai.zov_calls) == 2
+    assert ai.zov_calls[1]["history"] == [
+        {"role": "user", "content": "привет, Алина!"},
+        {"role": "assistant", "content": "своих не бросаем 🔥"},
+    ]
+
+
+async def test_zov_reset_ends_session(tmp_path, reference):
+    ai = FakeAI()
+    service, *_ = await _service(tmp_path, reference, {}, ai=ai)
+    await service.zov_reply(chat_id=-1001, text="йоу")
+    service.zov_reset(-1001)
+    assert not service.zov_active(-1001)
+    await service.zov_reply(chat_id=-1001, text="йоу снова")
+    assert ai.zov_calls[1]["history"] == [], "после сброса история пуста"
+
+
+async def test_zov_reply_without_ai_is_none(tmp_path, reference):
+    service, *_ = await _service(tmp_path, reference, {})  # ai=None
+    assert await service.zov_reply(chat_id=-1001, text="привет") is None
+    assert not service.zov_active(-1001)
+
+
+async def test_zov_session_expires_by_ttl(tmp_path, reference):
+    ai = FakeAI()
+    service, *_ = await _service(tmp_path, reference, {}, ai=ai)
+    await service.zov_reply(chat_id=-1001, text="привет")
+    service._zov[-1001].updated_at -= 10_000  # симулируем паузу дольше ZOZ_TTL
+    assert not service.zov_active(-1001)
+    await service.zov_reply(chat_id=-1001, text="снова")
+    assert ai.zov_calls[1]["history"] == [], "история начинается заново после паузы"
 
 
 async def test_ai_context_lists_subjects_and_hw(tmp_path, reference, load_fixture):

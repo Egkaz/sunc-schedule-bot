@@ -273,6 +273,28 @@ def create_router(config: Config, service: ScheduleService) -> Router:
         else:
             await answer(message, "Могу заказать только пиво: /заказать пиво")
 
+    @router.message(Command("zov"))
+    async def cmd_zov(message: Message, command: CommandObject) -> None:
+        """/zov <текст> — поболтать с Алиной (комедийный персонаж). /zov стоп — выйти."""
+        args = (command.args or "").strip()
+        if args.casefold() in {"стоп", "stop", "выход", "хватаит"}:
+            service.zov_reset(message.chat.id)
+            await answer(message, "Алина ушла читать каналы 🖤")
+            return
+        if not args:
+            await answer(message, "Пиши так: /zov привет! Команда /zov стоп — выйти из диалога.")
+            return
+
+        async def work() -> None:
+            try:
+                reply = await service.zov_reply(chat_id=message.chat.id, text=args)
+                if reply:
+                    await message.answer(reply)
+            except Exception:  # noqa: BLE001
+                log.exception("/zov: сбой обработки")
+
+        _spawn(work())
+
     @router.message(is_admin, CaptchaCodeFilter(service))
     async def captcha_reply(message: Message) -> None:
         """Ответ администратора цифрами — код капчи входа в журнал."""
@@ -331,9 +353,13 @@ def create_router(config: Config, service: ScheduleService) -> Router:
                     addressed,
                     raw[:80],
                 )
-                reply = await service.handle_chat_message(
-                    text=text, msg_id=message.message_id, addressed=addressed
-                )
+                # активна сессия /zov и есть обращение — продолжаем ролевой диалог
+                if addressed and service.zov_active(message.chat.id):
+                    reply = await service.zov_reply(chat_id=message.chat.id, text=text)
+                else:
+                    reply = await service.handle_chat_message(
+                        text=text, msg_id=message.message_id, addressed=addressed
+                    )
                 if reply:
                     await message.answer(reply)
                     log.info("ИИ: ответ отправлен в чат %s: %r", message.chat.id, reply[:80])

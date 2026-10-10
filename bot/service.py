@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Awaitable, Callable
@@ -43,6 +44,9 @@ AI_CONTEXT_DAYS = 7  # горизонт контекста ИИ (дней рас
 AI_MIN_LEN = 3  # слишком короткие сообщения не отправляем в ИИ
 AI_MAX_LEN = 1500
 
+ZOZ_TTL = 600  # секунд жизни сессии /zov без активности
+ZOZ_MAX_HISTORY = 20  # сколько пар сообщений помним в диалоге персонажа
+
 
 def _same_subject(left: str, right: str) -> bool:
     """Один и тот же предмет: точное совпадение или осмысленная подстрока."""
@@ -78,6 +82,14 @@ class PollResult:
     fail_streak: int = 0
 
 
+@dataclass
+class _ZovSession:
+    """Сессия ролевого диалога (/zov) по одному чату."""
+
+    history: list[dict] = field(default_factory=list)
+    updated_at: float = 0.0
+
+
 class ScheduleService:
     def __init__(
         self,
@@ -103,6 +115,7 @@ class ScheduleService:
         self.ai = ai
         self._captcha: asyncio.Future[str] | None = None
         self._ai_lock = asyncio.Lock()
+        self._zov: dict[int, _ZovSession] = {}
         try:
             self.tz = ZoneInfo(config.tz)
         except Exception:  # noqa: BLE001 - tzdata может отсутствовать
@@ -326,6 +339,45 @@ class ScheduleService:
             # на обращение молчать нельзя — подскажем, как спросить
             return "На связи! Спроси про расписание или ДЗ — например: «мяу какое дз завтра?»."
         return None
+
+    def _zov_session(self, chat_id: int) -> _ZovSession | None:
+        session = self._zov.get(chat_id)
+        if session is None:
+            return None
+        if time.monotonic() - session.updated_at > ZOZ_TTL:
+            self._zov.pop(chat_id, None)
+            return None
+        return session
+
+    def zov_active(self, chat_id: int) -> bool:
+        """Жива ли сессия /zov (после /zov стоп или паузы — нет)."""
+        return self._zov_session(chat_id) is not None
+
+    def zov_reset(self, chat_id: int) -> None:
+        self._zov.pop(chat_id, None)
+
+    async def zov_reply(self, *, chat_id: int, text: str) -> str | None:
+        """Ответ персонажа (Алина) с историей диалога по чату."""
+        if self.ai is None:
+            return None
+        text = text.strip()
+        if not text:
+            return None
+        session = self._zov_session(chat_id) or _ZovSession()
+        try:
+            reply = await self.ai.zov(user_text=text[:AI_MAX_LEN], history=session.history)
+        except Exception:  # noqa: BLE001 - ролевая шутка не должна ронять бота
+            log.exception("/zov: сбой ИИ")
+            reply = None
+        if not reply:
+            return "Алина залипла в телефоне 😔 попробуй ещё раз."
+        session.history.append({"role": "user", "content": text[:AI_MAX_LEN]})
+        session.history.append({"role": "assistant", "content": reply[:AI_MAX_LEN]})
+        if len(session.history) > ZOZ_MAX_HISTORY * 2:
+            session.history = session.history[-ZOZ_MAX_HISTORY * 2 :]
+        session.updated_at = time.monotonic()
+        self._zov[chat_id] = session
+        return reply[:AI_MAX_LEN]
 
     async def poll(self) -> PollResult:
         """Опрос горизонта дней для CLASS.
