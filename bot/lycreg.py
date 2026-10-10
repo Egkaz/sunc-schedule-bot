@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import ssl
+import time
 from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -29,6 +30,7 @@ HEADERS = {
 SUBJECT_MATCH_THRESHOLD = 0.55
 SUBJECT_CONTAIN_MIN = 4  # мин. длина для совпадения «подстрока в названии»
 HOMEWORK_MAX_AGE_DAYS = 10  # ДЗ старше этого срока не показываем («трёхнедельное»)
+JOURNAL_TTL = 600.0  # секунд кэша журнала (ИИ-контекст не должен долбить lycreg)
 
 # Словарь предметов сайта (subjDef из ini.js); дополняется ответом subjList
 SUBJ_DEF = {
@@ -248,6 +250,8 @@ class LycregClient:
         self._client = http
         self._teach_by_fio: dict[str, str] | None = None
         self._subj_names: dict[str, str] | None = None
+        self._journal_cache: dict | None = None
+        self._journal_at: float = 0.0
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -313,7 +317,15 @@ class LycregClient:
         return token or None
 
     async def journal(self) -> dict:
-        """Дневник; при истёкшем токене — CaptchaRequired."""
+        """Дневник (с кэшем JOURNAL_TTL); при истёкшем токене — CaptchaRequired."""
+        if self._journal_cache is not None and time.monotonic() - self._journal_at < JOURNAL_TTL:
+            return self._journal_cache
+        data = await self._fetch_journal()
+        self._journal_cache = data
+        self._journal_at = time.monotonic()
+        return data
+
+    async def _fetch_journal(self) -> dict:
         token = await self._token()
         if token:
             resp = await self._post(
@@ -351,13 +363,18 @@ class LycregClient:
         }
         self._subj_names = {**SUBJ_DEF, **(dict(subj_names) if isinstance(subj_names, dict) else {})}
 
-    async def homework(
-        self, klass: str, lessons: list[dict], target: date
-    ) -> list[tuple[str, str]]:
-        """[(предмет, ДЗ)] для уроков дня target; пустые ДЗ пропускаются."""
-        journal = await self.journal()
+    async def ensure_meta(self) -> None:
+        """Справочники преподавателей и предметов (лениво, один раз)."""
         if self._teach_by_fio is None or self._subj_names is None:
             await self._load_meta()
+
+    def pick_for_day(
+        self, journal: dict, klass: str, lessons: list[dict], target: date
+    ) -> list[tuple[str, str]]:
+        """[(предмет, ДЗ)] для уроков дня target; пустые ДЗ пропускаются.
+
+        Журнал и справочники должны быть загружены (journal() + ensure_meta()).
+        """
         assert self._teach_by_fio is not None and self._subj_names is not None
 
         target_pos = date_position(target)
@@ -381,3 +398,11 @@ class LycregClient:
                 items.append((subject, hw))
                 seen.add(subject)
         return items
+
+    async def homework(
+        self, klass: str, lessons: list[dict], target: date
+    ) -> list[tuple[str, str]]:
+        """[(предмет, ДЗ)] для уроков дня target; пустые ДЗ пропускаются."""
+        journal = await self.journal()
+        await self.ensure_meta()
+        return self.pick_for_day(journal, klass, lessons, target)

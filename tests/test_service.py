@@ -1,12 +1,13 @@
 ﻿from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 import pytest
 
+from bot.ai import ChatAnalysis, HomeworkDraft
 from bot.config import Config
 from bot.fetcher import FetchError, Reference
-from bot.service import ScheduleService, resolve_thread_id
+from bot.service import ScheduleService, _same_subject, resolve_thread_id
 from bot.storage import KEY_FAIL_STREAK, KEY_LAST_OK, KEY_THREAD_ID, Storage
 
 
@@ -51,6 +52,7 @@ async def _service(
     lycreg=None,
     admin_photos=None,
     photo_id=None,
+    ai=None,
 ):
     storage = Storage(tmp_path / "bot.db")
     await storage.open()
@@ -88,6 +90,7 @@ async def _service(
         send_photo=send_photo_chat if photo is not None else None,
         admin_photo=send_admin_photo if admin_photos is not None else None,
         lycreg=lycreg,
+        ai=ai,
     )
     return service, storage, sent, notified
 
@@ -315,9 +318,10 @@ def test_snapshot_digest_ignores_order():
 class FakeLycreg:
     """Заглушка LycregClient: отдаёт готовое ДЗ либо однократную ошибку."""
 
-    def __init__(self, items=None, error: Exception | None = None) -> None:
+    def __init__(self, items=None, error: Exception | None = None, login_error: Exception | None = None) -> None:
         self.items = items if items is not None else []
         self.error = error
+        self.login_error = login_error
         self.calls = 0
         self.logged_in: tuple[str, str] | None = None
 
@@ -330,7 +334,28 @@ class FakeLycreg:
 
     async def login(self, ci: str, code: str) -> str:
         self.logged_in = (ci, code)
+        if self.login_error is not None:
+            error, self.login_error = self.login_error, None
+            raise error
         return "TOK"
+
+
+class FakeAI:
+    """Заглушка AIClient: готовый анализ и/или код капчи."""
+
+    def __init__(self, analysis: ChatAnalysis | None = None, captcha_code: str | None = None) -> None:
+        self.analysis = analysis
+        self.captcha_code = captcha_code
+        self.analyze_calls = 0
+        self.captcha_calls = 0
+
+    async def analyze(self, **kwargs) -> ChatAnalysis | None:
+        self.analyze_calls += 1
+        return self.analysis
+
+    async def solve_captcha(self, image: bytes) -> str | None:
+        self.captcha_calls += 1
+        return self.captcha_code
 
 
 async def test_publish_puts_homework_into_caption(tmp_path, reference, load_fixture):
@@ -456,3 +481,183 @@ def test_target_date_for_homework_command():
     assert _target_date(service, 6) == date(2026, 10, 10)  # сб — завтра же
     assert _target_date(service, 1) == date(2026, 10, 12)  # пн — через два дня
     assert _target_date(service, 5) == date(2026, 10, 9)  # пт — сегодня
+
+
+def test_same_subject_matches_variants():
+    assert _same_subject("математика", "математика")
+    assert _same_subject("английский язык", "английский")
+    assert not _same_subject("физика", "химия")
+    assert not _same_subject("алгебра", "геометрия")
+
+
+async def test_homework_items_merges_journal_with_chat(tmp_path, reference):
+    lycreg = FakeLycreg(items=[("Алгебра", "§ 5 № 1-10")])
+    service, storage, *_ = await _service(tmp_path, reference, {}, lycreg=lycreg)
+    try:
+        await storage.save_chat_homework("2026-10-09", "Информатика", "тетр. с. 5")
+        await storage.save_chat_homework("2026-10-09", "Алгебра", "из чата")  # журнал приоритетнее
+        lessons = [{"subject": "Алгебра"}, {"subject": "Информатика"}]
+        items = await service.homework_items("10Н", lessons, date(2026, 10, 9))
+        assert items == [("Алгебра", "§ 5 № 1-10"), ("Информатика", "тетр. с. 5")]
+    finally:
+        await storage.close()
+
+
+async def test_homework_items_chat_only_when_journal_down(tmp_path, reference):
+    from bot.lycreg import LycregError
+
+    lycreg = FakeLycreg(error=LycregError("site down"))
+    service, storage, *_ = await _service(tmp_path, reference, {}, lycreg=lycreg)
+    try:
+        await storage.save_chat_homework("2026-10-09", "Химия", "лаб. № 3")
+        items = await service.homework_items("10Н", [], date(2026, 10, 9))
+        assert items == [("Химия", "лаб. № 3")]
+    finally:
+        await storage.close()
+
+
+async def test_homework_items_none_when_no_journal_and_no_chat(tmp_path, reference):
+    from bot.lycreg import LycregError
+
+    lycreg = FakeLycreg(error=LycregError("site down"))
+    service, storage, *_ = await _service(tmp_path, reference, {}, lycreg=lycreg)
+    try:
+        assert await service.homework_items("10Н", [], date(2026, 10, 9)) is None
+    finally:
+        await storage.close()
+
+
+async def test_publish_includes_chat_homework_when_journal_empty(tmp_path, reference, load_fixture):
+    payload = _payload(load_fixture)
+    photos: list[object] = []
+    lycreg = FakeLycreg(items=[])  # вход есть, а ДЗ в журнале нет
+    service, storage, *_ = await _service(
+        tmp_path, reference, payload, photo=photos, lycreg=lycreg, photo_id=31
+    )
+    try:
+        service.now = lambda: datetime(2026, 10, 8, 14, 0, tzinfo=service.tz)  # пост про пятницу
+        await storage.save_chat_homework("2026-10-09", "Обществознание", "конспект § 2")
+        text = await service.publish_tomorrow()
+        assert text and len(photos) == 1
+        assert "Обществознание" in photos[0].caption
+        assert "конспект § 2" in photos[0].caption
+    finally:
+        await storage.close()
+
+
+async def test_captcha_auto_solved_by_ai(tmp_path, reference, load_fixture):
+    from bot.lycreg import CaptchaRequired
+
+    payload = _payload(load_fixture)
+    photos: list[object] = []
+    lycreg = FakeLycreg(items=[("Алгебра", "ДЗ после входа")], error=CaptchaRequired("ci-9", b"IMG"))
+    ai = FakeAI(captcha_code="777")
+    service, storage, *_ = await _service(
+        tmp_path, reference, payload, photo=photos, lycreg=lycreg, ai=ai, photo_id=44
+    )
+    try:  # admin_photo не передан: раньше флоу был бы невозможен, теперь ИИ входит сам
+        service.now = lambda: datetime(2026, 10, 8, 14, 0, tzinfo=service.tz)
+        assert await service.publish_tomorrow()
+        assert ai.captcha_calls == 1
+        assert lycreg.logged_in == ("ci-9", "777")
+        assert "ДЗ после входа" in photos[0].caption
+        assert not service.captcha_pending
+    finally:
+        await storage.close()
+
+
+async def test_captcha_ai_wrong_code_falls_back_to_admin(tmp_path, reference, load_fixture):
+    from bot.lycreg import CaptchaRequired, LycregError
+
+    payload = _payload(load_fixture)
+    photos: list[object] = []
+    admin_pics: list[tuple[bytes, str]] = []
+    lycreg = FakeLycreg(
+        items=[("Алгебра", "ДЗ")],
+        error=CaptchaRequired("ci-1", b"IMG"),
+        login_error=LycregError("не тот код"),
+    )
+    ai = FakeAI(captcha_code="000")
+    service, storage, *_ = await _service(
+        tmp_path,
+        reference,
+        payload,
+        photo=photos,
+        lycreg=lycreg,
+        ai=ai,
+        admin_photos=admin_pics,
+        photo_id=45,
+    )
+
+    async def admin_photo(png: bytes, caption: str) -> None:
+        admin_pics.append((png, caption))
+        await service.submit_captcha("4242")
+
+    service.admin_photo = admin_photo
+    try:
+        service.now = lambda: datetime(2026, 10, 8, 14, 0, tzinfo=service.tz)
+        assert await service.publish_tomorrow()
+        assert ai.captcha_calls == 1
+        assert admin_pics and admin_pics[0][0] == b"IMG"  # ИИ ошибся — пошли админу
+        assert lycreg.logged_in == ("ci-1", "4242")
+        assert "ДЗ" in photos[0].caption
+    finally:
+        await storage.close()
+
+
+async def test_handle_chat_message_saves_homework_and_replies(tmp_path, reference):
+    analysis = ChatAnalysis(
+        homework=[HomeworkDraft(date(2026, 10, 12), "Алгебра", "§ 5 № 1-10")],
+        reply="На понедельник: Алгебра § 5 № 1-10",
+    )
+    ai = FakeAI(analysis=analysis)
+    service, storage, *_ = await _service(tmp_path, reference, {}, ai=ai)
+    try:
+        reply = await service.handle_chat_message(
+            text="какое дз по алгебре на завтра?", msg_id=99, addressed=True
+        )
+        assert reply == "На понедельник: Алгебра § 5 № 1-10"
+        assert ai.analyze_calls == 1
+        assert await storage.get_chat_homework("2026-10-12") == [("Алгебра", "§ 5 № 1-10")]
+    finally:
+        await storage.close()
+
+
+async def test_handle_chat_message_without_ai_is_noop(tmp_path, reference):
+    service, *_ = await _service(tmp_path, reference, {})  # ai=None
+    assert await service.handle_chat_message(text="какое дз?") is None
+
+
+async def test_handle_chat_message_skips_too_short(tmp_path, reference):
+    ai = FakeAI(analysis=ChatAnalysis(reply="ответ"))
+    service, *_ = await _service(tmp_path, reference, {}, ai=ai)
+    assert await service.handle_chat_message(text="  a  ") is None
+    assert await service.handle_chat_message(text="") is None
+    assert ai.analyze_calls == 0, "короткий мусор не должен жечь вызовы ИИ"
+
+
+async def test_handle_chat_message_no_reply_returns_none(tmp_path, reference):
+    ai = FakeAI(analysis=ChatAnalysis(homework=[], reply=None))
+    service, storage, *_ = await _service(tmp_path, reference, {}, ai=ai)
+    try:
+        reply = await service.handle_chat_message(text="вообще просто болтовня в чате", addressed=False)
+        assert reply is None
+        assert await storage.get_chat_homework("2026-10-12") == []
+    finally:
+        await storage.close()
+
+
+async def test_ai_context_lists_subjects_and_hw(tmp_path, reference, load_fixture):
+    payload = _payload(load_fixture)
+    service, storage, *_ = await _service(tmp_path, reference, payload)
+    try:
+        await service.poll()  # снимок расписания — источник уроков
+        service.now = lambda: datetime(2026, 10, 10, 12, 0, tzinfo=service.tz)  # суббота
+        await storage.save_chat_homework("2026-10-10", "Физика", "№ 42")
+        context = await service.ai_context(days=2)
+        assert "10.10" in context
+        assert "Физика: № 42" in context  # чат-ДЗ попало в контекст
+        assert "География: —" in context  # урок без ДЗ помечается прочерком
+        assert "занятий нет" in context  # 11.10 — воскресенье, уроков нет
+    finally:
+        await storage.close()

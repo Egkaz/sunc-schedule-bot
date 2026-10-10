@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import BaseFilter, Command, CommandObject
 from aiogram.types import BufferedInputFile, Message
@@ -268,6 +269,42 @@ def create_router(config: Config, service: ScheduleService) -> Router:
         """Ответ администратора цифрами — код капчи входа в журнал."""
         await service.submit_captcha((message.text or "").strip())
         await answer(message, "Код принят, вхожу в журнал…")
+
+    bot_username: str | None = None
+
+    async def _resolve_username(message: Message) -> str | None:
+        nonlocal bot_username
+        if bot_username is None:
+            me = await message.bot.get_me()
+            bot_username = me.username
+        return bot_username
+
+    @router.message(~F.from_user.is_bot, F.text | F.caption)
+    async def ai_chat_message(message: Message) -> None:
+        """Сообщения чата: ИИ собирает ДЗ в БД и отвечает на вопросы (в фоне)."""
+        if service.ai is None:
+            return
+        raw = (message.text or message.caption or "").strip()
+        if not raw or raw.startswith("/"):
+            return
+
+        async def work() -> None:
+            try:
+                username = await _resolve_username(message)
+                addressed = bool(username) and f"@{username}".lower() in raw.lower()
+                reply_to = message.reply_to_message
+                if reply_to is not None and reply_to.from_user is not None:
+                    me = await message.bot.get_me()
+                    addressed = addressed or reply_to.from_user.id == me.id
+                reply = await service.handle_chat_message(
+                    text=raw, msg_id=message.message_id, addressed=addressed
+                )
+                if reply:
+                    await message.answer(reply)
+            except Exception:  # noqa: BLE001 - фоновая работа ИИ не должна ронять поллинг
+                log.exception("ИИ: сбой обработки сообщения чата")
+
+        asyncio.create_task(work())
 
     return router
 

@@ -65,3 +65,28 @@ async def test_storage_survives_reopen(tmp_path):
         assert await second.get(KEY_LAST_OK) == "2026-10-08T18:03:00"
     finally:
         await second.close()
+
+
+async def test_chat_homework_roundtrip_and_upsert(tmp_path):
+    storage = Storage(tmp_path / "bot.db")
+    await storage.open()
+    try:
+        assert await storage.get_chat_homework("2026-10-12") == []
+
+        await storage.save_chat_homework("2026-10-12", "Алгебра", "§ 5 № 1-10", msg_id=11)
+        await storage.save_chat_homework("2026-10-12", "Информатика", "тетр. с. 5", msg_id=12)
+        await storage.save_chat_homework("2026-10-13", "Химия", "лаб. № 3", msg_id=13)
+
+        day = await storage.get_chat_homework("2026-10-12")
+        assert day == [("Алгебра", "§ 5 № 1-10"), ("Информатика", "тетр. с. 5")]
+        assert await storage.get_chat_homework("2026-10-13") == [("Химия", "лаб. № 3")]
+        assert await storage.get_chat_homework("2026-10-14") == []
+
+        # тот же предмет/день перезаписывается
+        await storage.save_chat_homework("2026-10-12", "Алгебра", "№ 11-15", msg_id=20)
+        assert await storage.get_chat_homework("2026-10-12") == [
+            ("Алгебра", "№ 11-15"),
+            ("Информатика", "тетр. с. 5"),
+        ]
+    finally:
+        await storage.close()

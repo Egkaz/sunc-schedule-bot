@@ -8,7 +8,7 @@ BASE = {"BOT_TOKEN": "123456:TESTTOKEN", "CHAT_ID": "-1001234567890", "CLASS": "
 
 
 def _set_env(monkeypatch, **extra: str) -> None:
-    for key in (*BASE, "THREAD_ID", "LYCREG_LOGIN", "LYCREG_PASSWORD"):
+    for key in (*BASE, "THREAD_ID", "LYCREG_LOGIN", "LYCREG_PASSWORD", "OPENROUTER_API_KEY"):
         monkeypatch.delenv(key, raising=False)
     for key, value in {**BASE, **extra}.items():
         monkeypatch.setenv(key, value)
@@ -41,3 +41,13 @@ def test_lycreg_credentials_loaded(monkeypatch):
     config = load_config()
     assert config.lycreg_login == "user42"
     assert config.lycreg_password == "secret"
+
+
+def test_openrouter_key_absent_means_ai_off(monkeypatch):
+    _set_env(monkeypatch)
+    assert load_config().openrouter_key == ""
+
+
+def test_openrouter_key_loaded(monkeypatch):
+    _set_env(monkeypatch, OPENROUTER_API_KEY="sk-or-v1-test")
+    assert load_config().openrouter_key == "sk-or-v1-test"

@@ -11,6 +11,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import AiogramError, TelegramUnauthorizedError
 from aiogram.types import BufferedInputFile
 
+from bot.ai import AIClient
 from bot.config import Config, ConfigError, load_config, load_dotenv
 from bot.fetcher import ScheduleClient
 from bot.handlers import create_router
@@ -95,6 +96,11 @@ async def run(config: Config) -> int:
     if config.lycreg_login and config.lycreg_password:
         lycreg = LycregClient(config.lycreg_login, config.lycreg_password, storage=storage)
 
+    ai = None
+    if config.openrouter_key:
+        ai = AIClient(config.openrouter_key)
+        log.info("ИИ подключён (OpenRouter, бесплатные модели)")
+
     service = ScheduleService(
         config,
         client,
@@ -104,6 +110,7 @@ async def run(config: Config) -> int:
         send_photo=send_photo_chat,
         admin_photo=send_admin_photo,
         lycreg=lycreg,
+        ai=ai,
     )
     dispatcher.include_router(create_router(config, service))
 
@@ -135,6 +142,8 @@ async def run(config: Config) -> int:
         await client.aclose()
         if lycreg is not None:
             await lycreg.aclose()
+        if ai is not None:
+            await ai.aclose()
         await storage.close()
         await bot.session.close()
     return code

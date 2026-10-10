@@ -10,8 +10,9 @@ from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 from bot import days as days_mod
+from bot.ai import AIClient
 from bot.config import Config
-from bot.differ import Snapshot, diff_days
+from bot.differ import NO_LESSON, Snapshot, diff_days
 from bot.fetcher import FetchError, ScheduleClient
 from bot.formatter import (
     AUDITORY_FIELDS,
@@ -37,6 +38,18 @@ NotifyAdmin = Callable[[str], Awaitable[None]]
 AdminPhoto = Callable[[bytes, str], Awaitable[None]]
 
 CAPTCHA_TIMEOUT = 600  # секунд на ответ администратора с кодом капчи
+
+AI_CONTEXT_DAYS = 7  # горизонт контекста ИИ (дней расписания/ДЗ)
+AI_MIN_LEN = 3  # слишком короткие сообщения не отправляем в ИИ
+AI_MAX_LEN = 1500
+
+
+def _same_subject(left: str, right: str) -> bool:
+    """Один и тот же предмет: точное совпадение или осмысленная подстрока."""
+    if left == right:
+        return True
+    shorter, longer = sorted((left, right), key=len)
+    return len(shorter) >= 4 and shorter in longer
 
 
 async def resolve_thread_id(storage: Storage, config: Config) -> int | None:
@@ -77,6 +90,7 @@ class ScheduleService:
         send_photo: SendPhoto | None = None,
         admin_photo: AdminPhoto | None = None,
         lycreg: LycregClient | None = None,
+        ai: AIClient | None = None,
     ) -> None:
         self.config = config
         self.client = client
@@ -86,7 +100,9 @@ class ScheduleService:
         self.send_photo = send_photo
         self.admin_photo = admin_photo
         self.lycreg = lycreg
+        self.ai = ai
         self._captcha: asyncio.Future[str] | None = None
+        self._ai_lock = asyncio.Lock()
         try:
             self.tz = ZoneInfo(config.tz)
         except Exception:  # noqa: BLE001 - tzdata может отсутствовать
@@ -148,8 +164,23 @@ class ScheduleService:
             self._captcha.set_result(code.strip())
 
     async def _login_with_captcha(self, exc: CaptchaRequired) -> bool:
-        """Капча админу в личку → ждём код → вход. True — вход выполнен."""
-        if self.lycreg is None or self.captcha_pending or self.admin_photo is None:
+        """Вход в журнал: сначала ИИ пробует распознать капчу, иначе — код от админа."""
+        if self.lycreg is None:
+            return False
+        if self.ai is not None:
+            code = None
+            try:
+                code = await self.ai.solve_captcha(exc.image)
+            except Exception:  # noqa: BLE001 - сбой ИИ не должен ломать флоу
+                log.exception("журнал: ИИ не смог обработать капчу")
+            if code:
+                try:
+                    await self.lycreg.login(exc.ci, code)
+                    log.info("журнал: капча распознана ИИ, вход выполнен")
+                    return True
+                except LycregError as error:
+                    log.info("журнал: код капчи от ИИ не подошёл: %s", error)
+        if self.captcha_pending or self.admin_photo is None:
             return False
         self._captcha = asyncio.get_running_loop().create_future()
         try:
@@ -176,18 +207,118 @@ class ScheduleService:
     async def homework_items(
         self, klass: str, lessons: list[dict], target: date
     ) -> list[tuple[str, str]] | None:
-        """ДЗ под уроки дня target; None — журнал недоступен."""
-        if self.lycreg is None:
+        """ДЗ под уроки дня target: журнал + ДЗ из чата; None — данных нет."""
+        journal_items: list[tuple[str, str]] | None = None
+        if self.lycreg is not None:
+            for attempt in (1, 2):
+                try:
+                    journal_items = await self.lycreg.homework(klass, lessons, target)
+                    break
+                except CaptchaRequired as exc:
+                    if attempt > 1 or not await self._login_with_captcha(exc):
+                        break
+                except LycregError as error:
+                    log.warning("журнал lycreg: %s", error)
+                    break
+        chat_items = await self.storage.get_chat_homework(target.isoformat())
+        if journal_items is None and not chat_items:
             return None
-        for attempt in (1, 2):
+        merged = list(journal_items or [])
+        have = [subject.casefold() for subject, _ in merged]
+        for subject, text in chat_items:
+            key = subject.casefold()
+            if any(_same_subject(key, known) for known in have):
+                continue  # журнал приоритетнее чата
+            merged.append((subject, text))
+            have.append(key)
+        return merged
+
+    async def ai_context(self, *, days: int = AI_CONTEXT_DAYS) -> str:
+        """Контекст для ИИ: уроки и ДЗ (журнал + чат) на ближайшие дни."""
+        today = self.now().date()
+        snapshot = await self.storage.get_snapshot()
+        journal = None
+        if self.lycreg is not None:
             try:
-                return await self.lycreg.homework(klass, lessons, target)
-            except CaptchaRequired as exc:
-                if attempt > 1 or not await self._login_with_captcha(exc):
-                    return None
+                journal = await self.lycreg.journal()
+                await self.lycreg.ensure_meta()
             except LycregError as error:
-                log.warning("журнал lycreg: %s", error)
+                log.info("ИИ-контекст: журнал недоступен (%s)", error)
+                journal = None
+            except Exception:  # noqa: BLE001 - контекст best-effort
+                log.exception("ИИ-контекст: сбой загрузки журнала")
+                journal = None
+        lines = []
+        for offset in range(days):
+            day = today + timedelta(days=offset)
+            weekday = days_mod.api_weekday(day)
+            lessons = (snapshot or {}).get(weekday, [])
+            subjects: list[str] = []
+            for lesson in lessons:
+                name = str(lesson.get("subject") or "").strip()
+                if name and name != NO_LESSON and name not in subjects:
+                    subjects.append(name)
+            if not subjects:
+                lines.append(f"{day:%d.%m}: занятий нет")
+                continue
+            hw_map: dict[str, str] = {}
+            if journal is not None and self.lycreg is not None:
+                try:
+                    for subject, hw in self.lycreg.pick_for_day(
+                        journal, self.config.klass, lessons, day
+                    ):
+                        hw_map[subject.casefold()] = hw
+                except Exception:  # noqa: BLE001
+                    log.exception("ИИ-контекст: не удалось подобрать ДЗ из журнала")
+            for subject, text in await self.storage.get_chat_homework(day.isoformat()):
+                hw_map.setdefault(subject.casefold(), text)
+            parts = [
+                f"{subject}: {hw_map[subject.casefold()]}" if subject.casefold() in hw_map else f"{subject}: —"
+                for subject in subjects
+            ]
+            lines.append(f"{day:%d.%m}: " + "; ".join(parts))
+        return "\n".join(lines)
+
+    async def handle_chat_message(
+        self,
+        *,
+        text: str,
+        msg_id: int = 0,
+        addressed: bool = False,
+    ) -> str | None:
+        """Сообщение чата через ИИ: сохранить ДЗ, вернуть ответ (или None)."""
+        if self.ai is None:
+            return None
+        text = text.strip()
+        if not (AI_MIN_LEN <= len(text) <= AI_MAX_LEN):
+            return None
+        if self._ai_lock.locked():
+            return None  # при ливне сообщений не копим очередь к бесплатным моделям
+        async with self._ai_lock:
+            try:
+                context = await self.ai_context()
+                analysis = await self.ai.analyze(
+                    context=context,
+                    text=text,
+                    today=self.now().date(),
+                    addressed=addressed,
+                )
+            except Exception:  # noqa: BLE001 - чат никогда не должен ломать бота
+                log.exception("ИИ: сбой анализа сообщения")
                 return None
+        if analysis is None:
+            return None
+        for item in analysis.homework:
+            if item.day is None or not item.subject or not item.text:
+                continue
+            try:
+                await self.storage.save_chat_homework(
+                    item.day.isoformat(), item.subject, item.text, msg_id
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("ИИ: не удалось сохранить ДЗ из чата")
+        if analysis.reply:
+            return analysis.reply[:1000]
         return None
 
     async def poll(self) -> PollResult:

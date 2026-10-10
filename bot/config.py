@@ -52,6 +52,7 @@ class Config:
     thread_id: int | None = None
     lycreg_login: str = ""
     lycreg_password: str = ""
+    openrouter_key: str = ""
     db_path: Path = Path("data/bot.db")
     horizon_days: int = 7
     base_url: str = "https://lyceum.urfu.ru"
@@ -115,6 +116,7 @@ def load_config() -> Config:
         thread_id=thread_id,
         lycreg_login=os.environ.get("LYCREG_LOGIN", "").strip(),
         lycreg_password=os.environ.get("LYCREG_PASSWORD", "").strip(),
+        openrouter_key=os.environ.get("OPENROUTER_API_KEY", "").strip(),
         db_path=Path(os.environ.get("DB_PATH", "data/bot.db").strip() or "data/bot.db"),
         horizon_days=horizon,
         base_url=(os.environ.get("BASE_URL", "").strip() or "https://lyceum.urfu.ru").rstrip("/"),

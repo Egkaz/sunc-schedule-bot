@@ -36,6 +36,12 @@ class Storage:
         await self._db.execute(
             "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
+        await self._db.execute(
+            "CREATE TABLE IF NOT EXISTS chat_homework ("
+            "day TEXT NOT NULL, subject TEXT NOT NULL, text TEXT NOT NULL, "
+            "msg_id INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, "
+            "PRIMARY KEY (day, subject))"
+        )
         await self._db.commit()
         log.info("хранилище открыто: %s", self.path)
 
@@ -99,3 +105,21 @@ class Storage:
         await self.set(KEY_SNAPSHOT, json.dumps(payload, ensure_ascii=False))
         stamp = (at or datetime.now()).isoformat(timespec="seconds")
         await self.set(KEY_SNAPSHOT_AT, stamp)
+
+    async def save_chat_homework(self, day: str, subject: str, text: str, msg_id: int = 0) -> None:
+        """ДЗ из чата класса: день (YYYY-MM-DD) + предмет -> текст."""
+        await self._conn().execute(
+            "INSERT INTO chat_homework (day, subject, text, msg_id, created_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(day, subject) DO UPDATE SET "
+            "text = excluded.text, msg_id = excluded.msg_id, created_at = excluded.created_at",
+            (day, subject, text, msg_id, datetime.now().isoformat(timespec="seconds")),
+        )
+        await self._conn().commit()
+
+    async def get_chat_homework(self, day: str) -> list[tuple[str, str]]:
+        """[(предмет, текст)] — ДЗ из чата на день (последняя запись предмета)."""
+        async with self._conn().execute(
+            "SELECT subject, text FROM chat_homework WHERE day = ? ORDER BY subject", (day,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [(str(row["subject"]), str(row["text"])) for row in rows]
